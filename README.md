@@ -8,8 +8,8 @@
 2. run command: ssh ec2-user@<ip>
 
 >> AWS ACCESS 
-export AWS_SECRET_ACCESS_KEY=ZnAnP4ax0B+Y0ZmVt7cTs/S1W9JytO+vl/A4aquv
-export AWS_ACCESS_KEY_ID=AKIAZK4VW7WERY4WADYB
+export AWS_SECRET_ACCESS_KEY=****
+export AWS_ACCESS_KEY_ID=*****
 
 **SSH without a PEM file but using ssh-agent,** follow these steps:
 1. **Start ssh-agent.** If it is not already running, start ssh-agent with the following command:
