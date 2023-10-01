@@ -36,7 +36,7 @@ async fn test1() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     });
 
-    future
+    Ok(future?)
 }
 
 

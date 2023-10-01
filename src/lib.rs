@@ -1,19 +1,23 @@
-use std::io;
 extern crate rusoto_core;
 extern crate rusoto_ec2;
 extern crate ssh2;
 extern crate rusoto_credential;
 extern crate tokio;
 
+#[macro_use] extern crate failure;
+
 use std::collections::HashMap;
-use std::net::TcpStream;
-use rusoto_core::RusotoError;
-use ssh2::Session;
 use rusoto_ec2::Ec2;
+use failure::Error;
 
 pub struct SshConnection;
 
 mod ssh;
+
+// #[derive(Debug, Fail)] 
+// pub enum BurstError {
+
+// }
 
 /*
  * Machine struct is used to store information about the spot instances which are running in AWS.
@@ -37,7 +41,7 @@ pub struct Machine {
 pub struct MachineSetup {
     instance_type: String,
     ami: String,
-    setup: Box<dyn Fn(&mut ssh::Session) -> io::Result<()>>
+    setup: Box<dyn Fn(&mut ssh::Session) -> Result<(), Error>>
 }
 
 
@@ -50,7 +54,7 @@ pub struct MachineSetup {
  */
 impl MachineSetup {
     pub fn new<F>(instance_type: &str, ami: &str, setup: F) -> Self
-    where F: Fn(&mut ssh::Session) -> io::Result<()> + 'static,
+    where F: Fn(&mut ssh::Session) -> Result<(), Error> + 'static,
     {
         MachineSetup {
             instance_type: instance_type.to_string(),
@@ -108,8 +112,8 @@ impl BurstBuilder {
      * descriptors field.
     */ 
     #[tokio::main]
-    pub async fn run<F>(self, f: F) -> Result<(), Box<dyn std::error::Error>>
-    where F: FnOnce(HashMap<String, Vec<Machine>>) -> io::Result<()> 
+    pub async fn run<F>(self, f: F) -> Result<(), Error>
+    where F: FnOnce(HashMap<String, Vec<Machine>>) -> Result<(), Error> 
     {
         //let provider = rusoto::EnvironmentProvider;
         use rusoto_core::{Region};
@@ -118,11 +122,11 @@ impl BurstBuilder {
         /*
         * Here we create a Ec2Client object with a credentials provider and region etc  
         */
-        // use rusoto_sts::{StsAssumeRoleSessionCredentialsProvider, StsClient};
-        // default_tls_client().unwrap(), EnvironmentProvider, 
         let credentials_provider = EnvironmentProvider::default();
         let ec2 = rusoto_ec2::Ec2Client::new_with(
-            rusoto_core::HttpClient::new().unwrap(),
+            rusoto_core::HttpClient::new()
+            .map_err(Error::from)
+            .map_err(|e| e.context("falied to create tls session for the ec2 api client"))?,
             credentials_provider,
             Region::UsEast1);
 
@@ -146,7 +150,10 @@ impl BurstBuilder {
             // TODO
             // req.block_duration_minutes = Some(self.max_duration);
             req.launch_specification = Some(launch);
-            let res = ec2.request_spot_instances(req).await?;
+            let res = ec2.request_spot_instances(req).await
+                                                        .map_err(Error::from)
+                                                        .map_err(|e| e.context(format!("falied to request spot instance for {}", name)))?;
+
             if let Some(spot_instance_requests) = res.spot_instance_requests {
                 // Handle spot_requests.
                 spot_req_ids.extend(
@@ -172,30 +179,54 @@ impl BurstBuilder {
         let mut req = rusoto_ec2::DescribeSpotInstanceRequestsRequest::default();
         req.spot_instance_request_ids = Some(spot_req_ids);
         let instances: Vec<_>;
+        let mut all_active;
         loop {
-            let res: rusoto_ec2::DescribeSpotInstanceRequestsResult = ec2.describe_spot_instance_requests(req.clone()).await?;
-            
+            let res = ec2.describe_spot_instance_requests(req.clone()).await;
+            if let Err(e) = res {
+                let msg = format!("{}",e);
+                if msg.contains("The spot instance request ID") && msg.contains("does not exist") {
+                    continue;
+                }
+                else {
+                    return Err(Error::from(e).context("falied to describe spot instances"))?;
+                }
+            }
+            let res = res.expect("Error check above");
             if let Some(spot_instance_requests) = res.spot_instance_requests {
                 // Handle spot_requests.
-                let all_ready = spot_instance_requests
+                let any_pending = spot_instance_requests
                                         .iter()
-                                        .all(|sir| sir.state.as_ref().unwrap() == "active");
+                                        .map(|sir| (sir, sir.state.as_ref().expect("spot request does not have state specified")))
+                                        .any(|(sir, state)| {
+                                            state == "open" || 
+                                            (state == "active" && sir.instance_id.is_none())
+                                        });
             
-                if all_ready {
+                if !any_pending {
+                    all_active = true;
                     instances = spot_instance_requests
                                     .into_iter()
                                     .filter_map(|sir| {
-                                        let name = id_to_name.remove(&sir.spot_instance_request_id.unwrap()).unwrap();
-                                        id_to_name.insert(sir.instance_id.as_ref().unwrap().clone(), name);
-                                        sir.instance_id
+                                        if sir.state.as_ref().unwrap() == "active" {
+                                            let name = id_to_name
+                                            .remove(&sir.spot_instance_request_id.expect("spot request must have spot request id"))
+                                            .expect("every spot request id is made for some machine set");
+
+                                            let instance_id = sir.instance_id.unwrap();
+                                            id_to_name.insert(instance_id.clone(), name);
+                                            Some(instance_id)
+                                        }
+                                        else {
+                                            all_active=false;
+                                            None
+                                        }
                                     })
                                     .collect();
                     break;
                 }
+                else {                        
+                }
             } 
-            else {
-                
-            }
         }
 
         /*
@@ -204,8 +235,10 @@ impl BurstBuilder {
         * All the requests happen once and all the instances are requested/started only once.
         */
         let mut cancel = rusoto_ec2::CancelSpotInstanceRequestsRequest::default();
-        cancel.spot_instance_request_ids = req.spot_instance_request_ids.unwrap();
-        ec2.cancel_spot_instance_requests(cancel).await?;
+        cancel.spot_instance_request_ids = req.spot_instance_request_ids.expect("this is set above");
+        ec2.cancel_spot_instance_requests(cancel).await
+        .map_err(Error::from)
+        .map_err(|e| e.context("falied to cancel spot instance request"))?;
 
 
         /****
@@ -221,10 +254,12 @@ impl BurstBuilder {
             machines.clear();
             all_ready = true;
             desc_req.instance_ids = Some(instances.clone());
-            let res: rusoto_ec2::DescribeInstancesResult = ec2.describe_instances(desc_req.clone()).await?;
+            let res: rusoto_ec2::DescribeInstancesResult = ec2.describe_instances(desc_req.clone()).await
+                                                                    .map_err(Error::from)
+                                                                    .map_err(|e| e.context("falied to cancel spot instance request"))?;
             if let Some(res_reservations) = res.reservations {
                 for reservations in res_reservations.into_iter() {
-                    for instance in reservations.instances.unwrap() {
+                    for instance in reservations.instances.unwrap_or_else(Vec::new) {
                         match instance {
                             rusoto_ec2::Instance {
                                 instance_id: Some(instance_id),
@@ -265,25 +300,56 @@ impl BurstBuilder {
          * finally authentication happens with ssh user agent authentication method 
          * Lastly a ssh channel is created for executing commands in the remote server and the output is also recieved & printed on local machine
          */
-        for (name,machines) in &mut machines {          
-            let f: &Box<dyn Fn(&mut ssh::Session) -> Result<(), io::Error>> = &setup_fns[name];  
-            for machine in machines {
-                let mut sess = ssh::Session::connect(&format!("{}:22", machine.public_dns)).unwrap();
-                f(&mut sess).unwrap(); 
-            } 
-         
+        if all_active
+        {
+            for (name,machines) in &mut machines {          
+                let f = &setup_fns[name];  
+                for machine in machines {
+                    let mut sess = ssh::Session::connect(&format!("{}:22", machine.public_dns))
+                    .map_err(Error::from)
+                    .map_err(|e| 
+                        e.context(format!(
+                            "falied to ssh to {} machine {}",
+                            name,
+                             machine.public_dns
+                            )
+                        )
+                    )?;
+                    f(&mut sess)
+                    .map_err(|e| 
+                        e.context(format!(
+                            "setup routine for {} machine failed",
+                            name
+                            )
+                        )
+                    )?; 
+                } 
+             
+            }
+            
+            f(machines)
+                .map_err(|e| 
+                    e.context("main routine failed")
+                )?;   
         }
-        
-        f(machines).unwrap();
-
 
         /***
          * Lastly ec2 remote instance termination request is executed  to stop all the instances started.
          */
         let mut termination_req = rusoto_ec2::TerminateInstancesRequest::default();
-        termination_req.instance_ids = desc_req.instance_ids.unwrap();
-        ec2.terminate_instances(termination_req).await?;
+        termination_req.instance_ids = desc_req.instance_ids.expect("set to Some further up");
+        while let Err(e) = ec2.terminate_instances(termination_req.clone()).await {
+            let msg = format!("{}", e);
+            if msg.contains("Pooled stream disconnected") || msg.contains("broken pipe") {
+                continue
+            }
+            else {
+                return Err(Error::from(e)
+                            .context("failed to terminate instances")
+                        )?;
+            }
 
+        }
         Ok(())
     }
 }
