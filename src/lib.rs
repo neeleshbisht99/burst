@@ -3,13 +3,16 @@ extern crate rusoto_ec2;
 extern crate ssh2;
 extern crate rusoto_credential;
 extern crate tokio;
+extern crate tempfile;
 
 #[macro_use] extern crate failure;
 
 use std::collections::HashMap;
+use rand::distributions::Alphanumeric;
 use rusoto_ec2::Ec2;
 use failure::Error;
-
+use failure::ResultExt;
+use std::io::{Write};
 pub struct SshConnection;
 
 mod ssh;
@@ -28,7 +31,8 @@ pub struct Machine {
     pub ssh: Option<ssh::Session>,
     pub instance_type: String,
     pub private_ip: String,
-    pub public_dns: String
+    pub public_dns: String,
+    pub public_ip: String
 }
  
 /*
@@ -125,10 +129,58 @@ impl BurstBuilder {
         let credentials_provider = EnvironmentProvider::default();
         let ec2 = rusoto_ec2::Ec2Client::new_with(
             rusoto_core::HttpClient::new()
-            .map_err(Error::from)
-            .map_err(|e| e.context("falied to create tls session for the ec2 api client"))?,
+            .context("falied to create tls session for the ec2 api client")?,
             credentials_provider,
             Region::UsEast1);
+
+        use rand::Rng;
+        let mut group_name = String::from("burst_security_");
+        group_name.extend(rand::thread_rng().sample_iter(&Alphanumeric).take(10).map(char::from));
+        
+        let mut req = rusoto_ec2::CreateSecurityGroupRequest::default();
+        req.group_name = group_name;
+        req.description = "Temporary access groups for burst vms".to_string();
+       
+        let res: rusoto_ec2::CreateSecurityGroupResult = ec2.create_security_group(req).await
+                                                            .context("falied to create security groups for new machine")?;
+
+        let group_id = res.group_id.expect("aws created security group with no group id");
+
+        // ssh access
+        let mut req = rusoto_ec2::AuthorizeSecurityGroupIngressRequest::default();
+        req.group_id = Some(group_id.clone());
+        req.ip_protocol = Some("tcp".to_string());
+        req.from_port = Some(22);
+        req.to_port = Some(22);
+        req.cidr_ip = Some("0.0.0.0/0".to_string());
+        let _ = ec2.authorize_security_group_ingress(req).await
+                    .context("falied to fill in security groups for new machine")?;
+
+        // Cross-VM Talk
+        let mut req = rusoto_ec2::AuthorizeSecurityGroupIngressRequest::default();
+        req.group_id = Some(group_id.clone());
+        req.ip_protocol = Some("tcp".to_string());
+        req.from_port = Some(0);
+        req.to_port = Some(65535);
+        req.cidr_ip = Some("172.31.0.0/16".to_string());
+
+        let _ = ec2.authorize_security_group_ingress(req).await
+                    .context("falied to fill in security groups for new machine")?;
+
+        let mut req = rusoto_ec2::CreateKeyPairRequest::default();
+        let mut key_name = String::from("burst_key_");
+        key_name.extend(rand::thread_rng().sample_iter(&Alphanumeric).take(10).map(char::from));
+        req.key_name = key_name.clone();
+
+        let res = ec2.create_key_pair(req).await
+                                .context("falied to generate new key pair")?;
+        
+        let private_key = res.key_material.expect("aws did not generate key material for new key");
+
+        
+        let mut private_key_file = tempfile::NamedTempFile::new().context("failed to create temporary file for key-pair")?;
+        private_key_file.write_all(private_key.as_bytes())
+            .context("could not write private key to the file")?;
 
         let mut setup_fns = HashMap::new();
         /*
@@ -142,8 +194,9 @@ impl BurstBuilder {
             launch.instance_type =Some(setup.instance_type);
             setup_fns.insert(name.clone(), setup.setup);
 
-            launch.security_groups = Some(vec!["test".to_string()]);
-            launch.key_name = Some("burst-key-pair".to_string());
+            launch.security_group_ids = Some(vec![group_id.clone()]);
+            launch.key_name = Some(key_name.clone());
+            
 
             let mut req = rusoto_ec2::RequestSpotInstancesRequest::default();          
             req.instance_count = Some(i64::from(number));
@@ -151,8 +204,7 @@ impl BurstBuilder {
             // req.block_duration_minutes = Some(self.max_duration);
             req.launch_specification = Some(launch);
             let res = ec2.request_spot_instances(req).await
-                                                        .map_err(Error::from)
-                                                        .map_err(|e| e.context(format!("falied to request spot instance for {}", name)))?;
+                                                     .context(format!("falied to request spot instance for {}", name))?;
 
             if let Some(spot_instance_requests) = res.spot_instance_requests {
                 // Handle spot_requests.
@@ -188,7 +240,7 @@ impl BurstBuilder {
                     continue;
                 }
                 else {
-                    return Err(Error::from(e).context("falied to describe spot instances"))?;
+                    return Err(e).context("falied to describe spot instances")?;
                 }
             }
             let res = res.expect("Error check above");
@@ -237,8 +289,7 @@ impl BurstBuilder {
         let mut cancel = rusoto_ec2::CancelSpotInstanceRequestsRequest::default();
         cancel.spot_instance_request_ids = req.spot_instance_request_ids.expect("this is set above");
         ec2.cancel_spot_instance_requests(cancel).await
-        .map_err(Error::from)
-        .map_err(|e| e.context("falied to cancel spot instance request"))?;
+        .context("falied to cancel spot instance request")?;
 
 
         /****
@@ -266,13 +317,15 @@ impl BurstBuilder {
                                 instance_type: Some(instance_type),
                                 private_ip_address: Some(private_ip),
                                 public_dns_name: Some(public_dns),
+                                public_ip_address: Some(public_ip),
                                 ..
                             } => {
                                 let machine = Machine{
                                     ssh:None,
                                     instance_type,
                                     private_ip,
-                                    public_dns
+                                    public_dns,
+                                    public_ip
                                 };
                                 let name = id_to_name[&instance_id].clone();
                                 machines.entry(name).or_insert_with(Vec::new).push(machine);
@@ -305,32 +358,24 @@ impl BurstBuilder {
             for (name,machines) in &mut machines {          
                 let f = &setup_fns[name];  
                 for machine in machines {
-                    let mut sess = ssh::Session::connect(&format!("{}:22", machine.public_dns))
-                    .map_err(Error::from)
-                    .map_err(|e| 
-                        e.context(format!(
-                            "falied to ssh to {} machine {}",
-                            name,
-                             machine.public_dns
-                            )
+                    let mut sess = ssh::Session::connect(&format!("{}:22", machine.public_ip), private_key_file.path())
+                    .context(format!(
+                        "falied to ssh to {} machine {}",
+                        name,
+                         machine.public_ip
                         )
                     )?;
                     f(&mut sess)
-                    .map_err(|e| 
-                        e.context(format!(
-                            "setup routine for {} machine failed",
-                            name
-                            )
-                        )
-                    )?; 
+                    .context(format!(
+                        "setup routine for {} machine failed",
+                        name
+                    ))?; 
                 } 
              
             }
             
             f(machines)
-                .map_err(|e| 
-                    e.context("main routine failed")
-                )?;   
+                .context("main routine failed")?;   
         }
 
         /***
@@ -344,9 +389,7 @@ impl BurstBuilder {
                 continue
             }
             else {
-                return Err(Error::from(e)
-                            .context("failed to terminate instances")
-                        )?;
+                return Err(e).context("failed to terminate instances")?;
             }
 
         }

@@ -1,6 +1,8 @@
 use ssh2;
 use std::{net::{self, TcpStream}};
-use failure::{Error, Context};
+use failure::{Error};
+use std::path::Path;
+use failure::ResultExt;
 
 pub struct Session {
     ssh: ssh2::Session,
@@ -8,7 +10,7 @@ pub struct Session {
 }
 
 impl Session  {
-    pub(crate) fn connect<A: net::ToSocketAddrs>(addr: A) -> Result<Self, Error> {
+    pub(crate) fn connect<A: net::ToSocketAddrs>(addr: A, key: &Path) -> Result<Self, Error> {
         
         let mut i = 0; 
 
@@ -16,23 +18,20 @@ impl Session  {
             match TcpStream::connect(&addr) {
                 Ok(s) => break s,
                 Err(_) if i <= 3 => i+=1,
-                Err(e) => Err(Error::from(e).context("falied to connect to ssh port"))?,
+                Err(e) => Err(e).context("falied to connect to ssh port")?,
             }
         };
         
         let mut sess = ssh2::Session::new()
-        .map_err(Error::from)
-        .map_err(|e| e.context("libssh2 not available"))?;
+        .context("libssh2 not available")?;
     
         let cloned_tcp = tcp.try_clone().unwrap();
         sess.set_tcp_stream(cloned_tcp);
         sess.handshake()
-            .map_err(Error::from)
-            .map_err(|e| e.context("failed to perform ssh handshake"))?;
+            .context("failed to perform ssh handshake")?;
 
-        sess.userauth_agent("ec2-user")
-            .map_err(Error::from)
-            .map_err(|e| e.context("failed to authenticate ssh session"))?;
+        sess.userauth_pubkey_file("ec2-user", None, key, None)
+            .context("failed to authenticate ssh session")?;
          
         Ok(Session{
             ssh: sess,
@@ -45,23 +44,19 @@ impl Session  {
         
         let mut channel = self.ssh
             .channel_session()
-            .map_err(Error::from)
-            .map_err(|e| e.context(format!("failed to create ssh channel for command '{}'", cmd)))?;
+            .context(format!("failed to create ssh channel for command '{}'", cmd))?;
         
         channel.exec(cmd)
-            .map_err(Error::from)
-            .map_err(|e| e.context(format!("failed to execute command '{}'", cmd)))?;
+                .context(format!("failed to execute command '{}'", cmd))?;
         
         let mut s = String::new(); 
         
         channel.read_to_string(&mut s)
-            .map_err(Error::from)
-            .map_err(|e| e.context(format!("failed to read results of command '{}'", cmd)))?;
+                .context(format!("failed to read results of command '{}'", cmd))?;
 
         
         channel.wait_close()
-            .map_err(Error::from)
-            .map_err(|e| e.context(format!("command '{}' never compeleted", cmd)))?;
+            .context(format!("command '{}' never compeleted", cmd))?;
     
         Ok(s) 
     }
