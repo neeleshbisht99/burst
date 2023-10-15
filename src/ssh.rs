@@ -30,6 +30,7 @@ impl Session  {
         sess.handshake()
             .context("failed to perform ssh handshake")?;
 
+        // ssh using the private key saved in temporary file, generated programmatically
         sess.userauth_pubkey_file("ec2-user", None, key, None)
             .context("failed to authenticate ssh session")?;
          

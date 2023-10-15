@@ -133,6 +133,9 @@ impl BurstBuilder {
             credentials_provider,
             Region::UsEast1);
 
+        /**
+         * Creating a security group
+         */
         use rand::Rng;
         let mut group_name = String::from("burst_security_");
         group_name.extend(rand::thread_rng().sample_iter(&Alphanumeric).take(10).map(char::from));
@@ -146,7 +149,8 @@ impl BurstBuilder {
 
         let group_id = res.group_id.expect("aws created security group with no group id");
 
-        // ssh access
+
+        // Adding rules to security group for ssh access and intra-machine communication
         let mut req = rusoto_ec2::AuthorizeSecurityGroupIngressRequest::default();
         req.group_id = Some(group_id.clone());
         req.ip_protocol = Some("tcp".to_string());
@@ -167,6 +171,7 @@ impl BurstBuilder {
         let _ = ec2.authorize_security_group_ingress(req).await
                     .context("falied to fill in security groups for new machine")?;
 
+        // creating a key pair 
         let mut req = rusoto_ec2::CreateKeyPairRequest::default();
         let mut key_name = String::from("burst_key_");
         key_name.extend(rand::thread_rng().sample_iter(&Alphanumeric).take(10).map(char::from));
@@ -177,7 +182,7 @@ impl BurstBuilder {
         
         let private_key = res.key_material.expect("aws did not generate key material for new key");
 
-        
+        // saving private key obtained to a temporary file for futhur usage like ssh
         let mut private_key_file = tempfile::NamedTempFile::new().context("failed to create temporary file for key-pair")?;
         private_key_file.write_all(private_key.as_bytes())
             .context("could not write private key to the file")?;
