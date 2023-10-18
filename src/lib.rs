@@ -1,3 +1,6 @@
+#[macro_use]
+extern crate slog;
+extern crate slog_term;
 extern crate rusoto_core;
 extern crate rusoto_ec2;
 extern crate ssh2;
@@ -10,12 +13,15 @@ extern crate failure;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::net::SocketAddr;
+use std::path::Path;
+use std::time;
 use rand::distributions::Alphanumeric;
 use rusoto_ec2::Ec2;
 use failure::Error;
 use failure::ResultExt;
 use std::io::{Write};
 use rayon::prelude::*;
+use slog::{Drain, o, info};
 pub struct SshConnection;
 
 mod ssh;
@@ -74,6 +80,7 @@ impl MachineSetup {
  */
 pub struct BurstBuilder {
     descriptors: HashMap<String, (MachineSetup, u32)>,
+    log: slog::Logger,
     max_duration: i64,
 }
 
@@ -85,6 +92,7 @@ impl Default for BurstBuilder {
     fn default() -> Self {
         BurstBuilder {
             descriptors: Default::default(),
+            log: slog::Logger::root(slog::Discard, o!()),
             max_duration: 60,
         }
     }
@@ -109,6 +117,18 @@ impl BurstBuilder {
         self.max_duration = hours as i64 * 60;
     }
 
+    pub fn set_logger(&mut self, log:slog::Logger) {
+        self.log = log;
+    }
+
+    pub fn use_term_logger(&mut self) {
+        let decorator = slog_term::TermDecorator::new().build();
+        let drain = slog_term::FullFormat::new(decorator).build();
+        let drain = std::sync::Mutex::new(drain).fuse();
+
+        self.log = slog::Logger::root(drain, o!());   
+    }
+
     /*
      * The method "add_set" adds a new "machine set" to the burst builder struct by adding a entry to the 
      * descriptors field.
@@ -121,6 +141,8 @@ impl BurstBuilder {
         use rusoto_core::{Region};
         use rusoto_credential::{EnvironmentProvider};
        
+        let log = &self.log;
+        debug!(log, "connecting to ec2");
         /*
         * Here we create a Ec2Client object with a credentials provider and region etc  
         */
@@ -131,6 +153,7 @@ impl BurstBuilder {
             credentials_provider,
             Region::UsEast1);
 
+        info!(log, "spinning up tusnami");
         /**
          * Creating a security group
          */
@@ -139,14 +162,16 @@ impl BurstBuilder {
         group_name.extend(rand::thread_rng().sample_iter(&Alphanumeric).take(10).map(char::from));
         
         let mut req = rusoto_ec2::CreateSecurityGroupRequest::default();
-        req.group_name = group_name;
+        req.group_name = group_name.clone();
         req.description = "Temporary access groups for burst vms".to_string();
-       
+            
+        trace!(log, "creating a security group name"; "name" => group_name);
         let res: rusoto_ec2::CreateSecurityGroupResult = ec2.create_security_group(req).await
                                                             .context("falied to create security groups for new machine")?;
 
         let group_id = res.group_id.expect("aws created security group with no group id");
 
+        trace!(log, "created security group"; "id" => &group_id);
 
         // Adding rules to security group for ssh access and intra-machine communication
         let mut req = rusoto_ec2::AuthorizeSecurityGroupIngressRequest::default();
@@ -155,6 +180,7 @@ impl BurstBuilder {
         req.from_port = Some(22);
         req.to_port = Some(22);
         req.cidr_ip = Some("0.0.0.0/0".to_string());
+        trace!(log, "adding ssh access to security group");
         let _ = ec2.authorize_security_group_ingress(req).await
                     .context("falied to fill in security groups for new machine")?;
 
@@ -165,10 +191,11 @@ impl BurstBuilder {
         req.from_port = Some(0);
         req.to_port = Some(65535);
         req.cidr_ip = Some("172.31.0.0/16".to_string());
-
+        trace!(log, "adding internal VM access to security group");
         let _ = ec2.authorize_security_group_ingress(req).await
                     .context("falied to fill in security groups for new machine")?;
 
+        trace!(log, "creating keypair");
         // creating a key pair 
         let mut req = rusoto_ec2::CreateKeyPairRequest::default();
         let mut key_name = String::from("burst_key_");
@@ -177,7 +204,7 @@ impl BurstBuilder {
 
         let res = ec2.create_key_pair(req).await
                                 .context("falied to generate new key pair")?;
-        
+        trace!(log, "created keypair"; "fingerprint" => res.key_fingerprint);
         let private_key = res.key_material.expect("aws did not generate key material for new key");
 
         // saving private key obtained to a temporary file for futhur usage like ssh
@@ -185,12 +212,19 @@ impl BurstBuilder {
         private_key_file.write_all(private_key.as_bytes())
             .context("could not write private key to the file")?;
 
+        if let Some(filename) = Path::new(private_key_file.path()).to_str() {
+            trace!(log, "wrote keypair to file"; "filename" => filename) ;
+        } else {
+
+        }
+       
         let mut setup_fns = HashMap::new();
         /*
         * Here we are calling requesting spot instances for all the machine sets and storing the request ids in spot_req_ids.
         */
         let mut id_to_name = HashMap::new();
         let mut spot_req_ids = Vec::new();
+        debug!(log, "issuing spot requests");
         for (name, (setup, number)) in self.descriptors {
             let mut launch = rusoto_ec2::RequestSpotLaunchSpecification::default();
             launch.image_id = Some(setup.ami);
@@ -209,6 +243,7 @@ impl BurstBuilder {
             let res = ec2.request_spot_instances(req).await
                                                      .context(format!("falied to request spot instance for {}", name))?;
 
+            trace!(log, "issuing spot request for {}", name;"#" => number);
             if let Some(spot_instance_requests) = res.spot_instance_requests {
                 // Handle spot_requests.
                 spot_req_ids.extend(
@@ -217,6 +252,7 @@ impl BurstBuilder {
                         |sir| sir.spot_instance_request_id
                     )
                     .map(|sir| {
+                        trace!(log, "activated spot request"; "id" => &sir);
                         id_to_name.insert(sir.clone(), name.clone());
                         sir
                     })
@@ -235,11 +271,14 @@ impl BurstBuilder {
         req.spot_instance_request_ids = Some(spot_req_ids);
         let instances: Vec<_>;
         let mut all_active;
+        debug!(log, "waiting for instances to spwan");
         loop {
+            trace!(log, "checking spot request status");
             let res = ec2.describe_spot_instance_requests(req.clone()).await;
             if let Err(e) = res {
                 let msg = format!("{}",e);
                 if msg.contains("The spot instance request ID") && msg.contains("does not exist") {
+                    trace!(log, "spot instance request not yet ready");
                     continue;
                 }
                 else {
@@ -253,8 +292,13 @@ impl BurstBuilder {
                                         .iter()
                                         .map(|sir| (sir, sir.state.as_ref().expect("spot request does not have state specified")))
                                         .any(|(sir, state)| {
-                                            state == "open" || 
-                                            (state == "active" && sir.instance_id.is_none())
+                                            if state == "open" ||  (state == "active" && sir.instance_id.is_none()) {
+                                                true
+                                            }
+                                            else {
+                                                trace!(log, "spot instance request not yet ready"; "state" => state, "id" => &sir.spot_instance_request_id);
+                                                false
+                                            }
                                         });
             
                 if !any_pending {
@@ -268,6 +312,7 @@ impl BurstBuilder {
                                             .expect("every spot request id is made for some machine set");
 
                                             let instance_id = sir.instance_id.unwrap();
+                                            trace!(log, "spot request satisfied"; "setup" => &name, "iid" => &instance_id);
                                             id_to_name.insert(instance_id.clone(), name);
                                             Some(instance_id)
                                         }
@@ -289,6 +334,7 @@ impl BurstBuilder {
         * The spot instance requests are cancelled, to ensure that if anyone of the instances stops, the spot instance requests are not called again.
         * All the requests happen once and all the instances are requested/started only once.
         */
+        trace!(log, "terminating spot requests");
         let mut cancel = rusoto_ec2::CancelSpotInstanceRequestsRequest::default();
         cancel.spot_instance_request_ids = req.spot_instance_request_ids.expect("this is set above");
         ec2.cancel_spot_instance_requests(cancel).await
@@ -331,6 +377,7 @@ impl BurstBuilder {
                                     public_ip
                                 };
                                 let name = id_to_name[&instance_id].clone();
+                                trace!(log, "instance ready"; "set" => &name, "ip"=> &machine.public_ip);
                                 machines.entry(name).or_insert_with(Vec::new).push(machine);
                             }
                             _=> { 
@@ -359,6 +406,7 @@ impl BurstBuilder {
         let mut errors: Vec<Error> = Vec::new();
         if all_active
         {
+            info!(log, "all machines instantiated; running setup routines");
             for (name,machines) in &mut machines {          
                 let f = &setup_fns[name];  
                 errors.par_extend(
@@ -378,22 +426,34 @@ impl BurstBuilder {
                                         "falied to ssh to {} machine {}",
                                         name,
                                         machine.public_ip
-                                        )
-                                    )?;
+                                        )).map_err(|e| {
+                                            error!(log, "failed to ssh to {}:{}", name, machine.public_ip);
+                                            e
+                                        })?;
+
+                                    debug!(log, "setting up {} instance", &name; "ip"=> &machine.public_ip);
                                     f(&mut sess)
                                     .context(format!(
                                         "setup routine for {} machine failed",
                                         name
-                                    ))?; 
-
+                                    )).map_err(|e| {
+                                        error!(log, "setup for {} machine failed", name);
+                                        e
+                                    })?; 
+                                    info!(log, "finished setting up {} instance", &name; "ip"=> &machine.public_ip);
                                     Ok(())
                     }) 
                     .filter_map(Result::err)
                 ); 
             }
             if errors.is_empty() {
-                f(machines)
-                .context("main routine failed")?;
+                let start = time::Instant::now();
+                info!(log, "quiet before storm");
+                f(machines).context("main routi  ne failed").map_err(|e| {
+                    crit!(log, "main tusnami failed");
+                    e
+                })?;
+                info!(log, "power of the tsunami unleashed"; "duration" => start.elapsed().as_secs());
             }
                
         }
@@ -401,28 +461,33 @@ impl BurstBuilder {
         /***
          * Lastly ec2 remote instance termination request is executed  to stop all the instances started.
          */
+        debug!(log, "terminating instances");
         let mut termination_req = rusoto_ec2::TerminateInstancesRequest::default();
         termination_req.instance_ids = desc_req.instance_ids.expect("set to Some further up");
         while let Err(e) = ec2.terminate_instances(termination_req.clone()).await {
             let msg = format!("{}", e);
             if msg.contains("Pooled stream disconnected") || msg.contains("broken pipe") {
+                trace!(log, "retrying instance termination");
                 continue
             }
             else {
                 return Err(e).context("failed to terminate instances")?;
             }
-
         }
 
-        let mut req = rusoto_ec2::DeleteSecurityGroupRequest::default();
-        req.group_id = Some(group_id);
+        //debug!(log, "cleaning up temporary resources");
+        //trace!(log, "cleaning up terminating security group");
+        // let mut req = rusoto_ec2::DeleteSecurityGroupRequest::default();
+        // req.group_id = Some(group_id);
         
-        ec2.delete_security_group(req).await.context("failed to clean secuity group")?;
-
-        let mut req = rusoto_ec2::DeleteKeyPairRequest::default();
-        req.key_name = Some(key_name);
-        ec2.delete_key_pair(req).await.context("failed to clean key pair")?;
+        // ec2.delete_security_group(req).await.context("failed to clean secuity group")?;
+        
+        //trace!(log, "cleaning up terminating keypair");
+        // let mut req = rusoto_ec2::DeleteKeyPairRequest::default();
+        // req.key_name = Some(key_name);
+        // ec2.delete_key_pair(req).await.context("failed to clean key pair")?;
     
+        debug!(log, "all done");
         errors.into_iter().next().map(|e| Err(e)).unwrap_or(Ok(()))         
     }
 }

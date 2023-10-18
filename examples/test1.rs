@@ -7,7 +7,7 @@ use burst::{MachineSetup, BurstBuilder, Machine};
 
 async fn test1() -> Result<(), Box<dyn std::error::Error>> {
     let mut b = BurstBuilder::default();
-
+    b.use_term_logger();
     b.add_set(
         "server", 
         1, 

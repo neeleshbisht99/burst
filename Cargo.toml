@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[features] 
+debug = ["slog/max_level_trace", "slog/release_max_level_debug"]
 
 [dependencies]
 rusoto_core = "0.48.0"
@@ -17,6 +19,8 @@ failure = "0.1.8"
 rand = "0.8"
 tempfile = "3"
 rayon = "1.8.0"
+slog = "2.7.0"
+slog-term = "2.9.0"
 
 [examples]
 example1 = { name = "test1", path = "examples/test1.rs" }
