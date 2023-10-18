@@ -119,6 +119,7 @@ dependencies = [
  "rusoto_core",
  "rusoto_credential",
  "rusoto_ec2",
+ "scopeguard",
  "slog",
  "slog-term",
  "ssh2",

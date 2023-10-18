@@ -21,6 +21,7 @@ tempfile = "3"
 rayon = "1.8.0"
 slog = "2.7.0"
 slog-term = "2.9.0"
+scopeguard = "1.2.0"
 
 [examples]
 example1 = { name = "test1", path = "examples/test1.rs" }

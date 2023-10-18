@@ -9,8 +9,10 @@ extern crate tokio;
 extern crate tempfile;
 extern crate rayon;
 extern crate failure;
+#[macro_use(defer)] extern crate scopeguard;
 
 use std::collections::HashMap;
+use std::mem;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -19,6 +21,7 @@ use rand::distributions::Alphanumeric;
 use rusoto_ec2::Ec2;
 use failure::Error;
 use failure::ResultExt;
+use tokio::runtime::Handle;
 use std::io::{Write};
 use rayon::prelude::*;
 use slog::{Drain, o, info};
@@ -329,6 +332,46 @@ impl BurstBuilder {
             } 
         }
 
+        let mut term_instances  = instances.clone();
+        let ec2_clone  = ec2.clone();
+        let log_clone  = log.clone();
+        defer!{{
+            /***
+             * Lastly ec2 remote instance termination request is executed  to stop all the instances started.
+             */
+            debug!(log_clone, "terminating instances");
+            let executor = Handle::current();
+            let mut termination_req = rusoto_ec2::TerminateInstancesRequest::default();
+            termination_req.instance_ids = mem::replace(&mut term_instances, Vec::new());
+            executor.spawn({
+                async move{
+                    while let Err(e) = ec2_clone.terminate_instances(termination_req.clone()).await {
+                        let msg = format!("{}", e);
+                        if msg.contains("Pooled stream disconnected") || msg.contains("broken pipe") {
+                            trace!(log_clone, "retrying instance termination");
+                            continue
+                        }
+                        else {
+                            warn!(log_clone, "failed to terminate instances : {:?}", e);
+                        }
+                    }
+        
+                    //debug!(log, "cleaning up temporary resources");
+                    //trace!(log, "cleaning up terminating security group");
+                    // let mut req = rusoto_ec2::DeleteSecurityGroupRequest::default();
+                    // req.group_id = Some(group_id);
+                    
+                    // ec2.delete_security_group(req).await.context("failed to clean secuity group")?;
+                    
+                    //trace!(log, "cleaning up terminating keypair");
+                    // let mut req = rusoto_ec2::DeleteKeyPairRequest::default();
+                    // req.key_name = Some(key_name);
+                    // ec2.delete_key_pair(req).await.context("failed to clean key pair")?;
+                }
+            });
+        }}
+
+
         /*
         * Here once all the ec2 spot instance requests are satified, the instances are now starting or runing.
         * The spot instance requests are cancelled, to ensure that if anyone of the instances stops, the spot instance requests are not called again.
@@ -338,7 +381,10 @@ impl BurstBuilder {
         let mut cancel = rusoto_ec2::CancelSpotInstanceRequestsRequest::default();
         cancel.spot_instance_request_ids = req.spot_instance_request_ids.expect("this is set above");
         ec2.cancel_spot_instance_requests(cancel).await
-        .context("falied to cancel spot instance request")?;
+        .context("falied to cancel spot instance request").map_err(|e| {
+            warn!(log, "failed to cancel sopt instance requests: {:?}", e);
+            e
+        })?;
 
 
         /****
@@ -458,35 +504,6 @@ impl BurstBuilder {
                
         }
 
-        /***
-         * Lastly ec2 remote instance termination request is executed  to stop all the instances started.
-         */
-        debug!(log, "terminating instances");
-        let mut termination_req = rusoto_ec2::TerminateInstancesRequest::default();
-        termination_req.instance_ids = desc_req.instance_ids.expect("set to Some further up");
-        while let Err(e) = ec2.terminate_instances(termination_req.clone()).await {
-            let msg = format!("{}", e);
-            if msg.contains("Pooled stream disconnected") || msg.contains("broken pipe") {
-                trace!(log, "retrying instance termination");
-                continue
-            }
-            else {
-                return Err(e).context("failed to terminate instances")?;
-            }
-        }
-
-        //debug!(log, "cleaning up temporary resources");
-        //trace!(log, "cleaning up terminating security group");
-        // let mut req = rusoto_ec2::DeleteSecurityGroupRequest::default();
-        // req.group_id = Some(group_id);
-        
-        // ec2.delete_security_group(req).await.context("failed to clean secuity group")?;
-        
-        //trace!(log, "cleaning up terminating keypair");
-        // let mut req = rusoto_ec2::DeleteKeyPairRequest::default();
-        // req.key_name = Some(key_name);
-        // ec2.delete_key_pair(req).await.context("failed to clean key pair")?;
-    
         debug!(log, "all done");
         errors.into_iter().next().map(|e| Err(e)).unwrap_or(Ok(()))         
     }
