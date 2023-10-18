@@ -16,6 +16,7 @@ tokio-sync = "0.1"
 failure = "0.1.8"
 rand = "0.8"
 tempfile = "3"
+rayon = "1.8.0"
 
 [examples]
 example1 = { name = "test1", path = "examples/test1.rs" }

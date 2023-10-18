@@ -4,23 +4,21 @@ extern crate ssh2;
 extern crate rusoto_credential;
 extern crate tokio;
 extern crate tempfile;
-
-#[macro_use] extern crate failure;
+extern crate rayon;
+extern crate failure;
 
 use std::collections::HashMap;
+use std::net::IpAddr;
+use std::net::SocketAddr;
 use rand::distributions::Alphanumeric;
 use rusoto_ec2::Ec2;
 use failure::Error;
 use failure::ResultExt;
 use std::io::{Write};
+use rayon::prelude::*;
 pub struct SshConnection;
 
 mod ssh;
-
-// #[derive(Debug, Fail)] 
-// pub enum BurstError {
-
-// }
 
 /*
  * Machine struct is used to store information about the spot instances which are running in AWS.
@@ -45,7 +43,7 @@ pub struct Machine {
 pub struct MachineSetup {
     instance_type: String,
     ami: String,
-    setup: Box<dyn Fn(&mut ssh::Session) -> Result<(), Error>>
+    setup: Box<dyn Fn(&mut ssh::Session) -> Result<(), Error> + Sync> 
 }
 
 
@@ -58,7 +56,7 @@ pub struct MachineSetup {
  */
 impl MachineSetup {
     pub fn new<F>(instance_type: &str, ami: &str, setup: F) -> Self
-    where F: Fn(&mut ssh::Session) -> Result<(), Error> + 'static,
+    where F: Fn(&mut ssh::Session) -> Result<(), Error> + 'static + Sync,
     {
         MachineSetup {
             instance_type: instance_type.to_string(),
@@ -358,29 +356,46 @@ impl BurstBuilder {
          * finally authentication happens with ssh user agent authentication method 
          * Lastly a ssh channel is created for executing commands in the remote server and the output is also recieved & printed on local machine
          */
+        let mut errors: Vec<Error> = Vec::new();
         if all_active
         {
             for (name,machines) in &mut machines {          
                 let f = &setup_fns[name];  
-                for machine in machines {
-                    let mut sess = ssh::Session::connect(&format!("{}:22", machine.public_ip), private_key_file.path())
-                    .context(format!(
-                        "falied to ssh to {} machine {}",
-                        name,
-                         machine.public_ip
-                        )
-                    )?;
-                    f(&mut sess)
-                    .context(format!(
-                        "setup routine for {} machine failed",
-                        name
-                    ))?; 
-                } 
-             
+                errors.par_extend(
+                    machines
+                                .par_iter_mut()
+                                .map(|machine| -> Result<_, Error>{
+                                    let mut sess = ssh::Session::connect(
+                                        SocketAddr::new(
+                                            machine.public_ip
+                                            .parse::<IpAddr>()
+                                            .context("machine ip is not an ip address")?, 
+                                            22),
+                                        // &format!("{}:22", machine.public_ip),
+                                         private_key_file.path()
+                                        )
+                                    .context(format!(
+                                        "falied to ssh to {} machine {}",
+                                        name,
+                                        machine.public_ip
+                                        )
+                                    )?;
+                                    f(&mut sess)
+                                    .context(format!(
+                                        "setup routine for {} machine failed",
+                                        name
+                                    ))?; 
+
+                                    Ok(())
+                    }) 
+                    .filter_map(Result::err)
+                ); 
             }
-            
-            f(machines)
-                .context("main routine failed")?;   
+            if errors.is_empty() {
+                f(machines)
+                .context("main routine failed")?;
+            }
+               
         }
 
         /***
@@ -398,7 +413,17 @@ impl BurstBuilder {
             }
 
         }
-        Ok(())
+
+        let mut req = rusoto_ec2::DeleteSecurityGroupRequest::default();
+        req.group_id = Some(group_id);
+        
+        ec2.delete_security_group(req).await.context("failed to clean secuity group")?;
+
+        let mut req = rusoto_ec2::DeleteKeyPairRequest::default();
+        req.key_name = Some(key_name);
+        ec2.delete_key_pair(req).await.context("failed to clean key pair")?;
+    
+        errors.into_iter().next().map(|e| Err(e)).unwrap_or(Ok(()))         
     }
 }
 
